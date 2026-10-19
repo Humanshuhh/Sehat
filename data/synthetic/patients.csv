@@ -1,0 +1,4 @@
+patient_id,age,bmi,hba1c,previous_diabetes
+P001,45,28.4,6.1,0
+P002,52,31.2,6.8,1
+P003,38,24.5,5.4,0
