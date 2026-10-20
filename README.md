@@ -254,6 +254,12 @@ Potential future improvements:
 - [ ] SHAP-based explanations, if compatible with the prediction model
 - [ ] Database-backed patient history instead of CSV storage
 
+## Demonstartion Video
+https://drive.google.com/file/d/19dWIHiEH1C4CF9Sf9Nh2bH-hwukDfdBW/view?usp=sharing
+
+## Project Ppt
+https://docs.google.com/presentation/d/1Ib88Wjc10uJUvxBybpy-AmAwH7Es9c6L/edit?usp=sharing&ouid=102254179299783730485&rtpof=true&sd=true
+
 ## 🤝 Contributing
 
 Contributions and suggestions are welcome.
