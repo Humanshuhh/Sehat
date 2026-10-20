@@ -1,6 +1,7 @@
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from pathlib import Path
 
 from backend.services.twin_service import  (
     get_patient_twin,
@@ -338,3 +339,145 @@ def patient_alert_history(patient_id: str, limit: int = 100):
 @app.get("/patients/{patient_id}/alerts/summary")
 def patient_alert_summary(patient_id: str):
     return get_alert_history_summary(patient_id)
+
+
+
+# ---------- SMART GLUCOSE ALERTS ----------
+
+CSV_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "data"
+    / "synthetic"
+    / "patients.csv"
+)
+
+# Configurable thresholds for this synthetic demo only.
+HIGH_GLUCOSE = 180.0
+LOW_GLUCOSE = 70.0
+RAPID_RISE = 30.0
+RAPID_RISE_WINDOW_MINUTES = 30
+
+
+def detect_glucose_alerts(patient_df: pd.DataFrame) -> list[dict]:
+    """Detect unusual glucose patterns in one patient's readings."""
+
+    required = {"timestamp", "glucose"}
+    if not required.issubset(patient_df.columns):
+        raise ValueError("Patient data must contain timestamp and glucose.")
+
+    df = patient_df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df["glucose"] = pd.to_numeric(df["glucose"], errors="coerce")
+
+    df = (
+        df.dropna(subset=["timestamp", "glucose"])
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+    alerts = []
+
+    for i, row in df.iterrows():
+        glucose = float(row["glucose"])
+        timestamp = row["timestamp"].isoformat()
+
+        # Check the current reading.
+        if glucose >= HIGH_GLUCOSE:
+            alerts.append({
+                "type": "high_glucose",
+                "severity": "warning",
+                "timestamp": timestamp,
+                "glucose": glucose,
+                "message": (
+                    f"Glucose reading {glucose:.1f} is at or above "
+                    f"the demo threshold of {HIGH_GLUCOSE:.0f}."
+                ),
+            })
+
+        elif glucose < LOW_GLUCOSE:
+            alerts.append({
+                "type": "low_glucose",
+                "severity": "warning",
+                "timestamp": timestamp,
+                "glucose": glucose,
+                "message": (
+                    f"Glucose reading {glucose:.1f} is below "
+                    f"the demo threshold of {LOW_GLUCOSE:.0f}."
+                ),
+            })
+
+        # Compare with the immediately previous reading.
+        if i > 0:
+            previous = df.iloc[i - 1]
+            minutes = (
+                row["timestamp"] - previous["timestamp"]
+            ).total_seconds() / 60
+
+            rise = glucose - float(previous["glucose"])
+
+            if (
+                0 < minutes <= RAPID_RISE_WINDOW_MINUTES
+                and rise >= RAPID_RISE
+            ):
+                alerts.append({
+                    "type": "rapid_rise",
+                    "severity": "warning",
+                    "timestamp": timestamp,
+                    "glucose": glucose,
+                    "change": round(rise, 1),
+                    "minutes": round(minutes, 1),
+                    "message": (
+                        f"Glucose rose by {rise:.1f} within "
+                        f"{minutes:.1f} minutes."
+                    ),
+                })
+
+    # Show the newest alerts first.
+    alerts.sort(key=lambda alert: alert["timestamp"], reverse=True)
+    return alerts
+
+
+@app.get("/patients/{patient_id}/alerts")
+def get_patient_glucose_alerts(patient_id: str):
+    """Return demo glucose alerts for a patient."""
+
+    if not CSV_PATH.exists():
+        raise HTTPException(
+            status_code=500,
+            detail=f"Patient CSV not found: {CSV_PATH}",
+        )
+
+    try:
+        df = pd.read_csv(CSV_PATH, dtype={"patient_id": str})
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not read patient data: {exc}",
+        )
+
+    required = {"patient_id", "timestamp", "glucose"}
+    if not required.issubset(df.columns):
+        raise HTTPException(
+            status_code=500,
+            detail="CSV must contain patient_id, timestamp, and glucose.",
+        )
+
+    patient_df = df[df["patient_id"] == patient_id]
+
+    if patient_df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No readings found for patient {patient_id}.",
+        )
+
+    try:
+        alerts = detect_glucose_alerts(patient_df)
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {
+        "patient_id": patient_id,
+        "alert_count": len(alerts),
+        "alerts": alerts,
+        "demo_only": True,
+    }

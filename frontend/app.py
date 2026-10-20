@@ -7,6 +7,13 @@ from streamlit_autorefresh import st_autorefresh
 
 API_BASE_URL = "http://127.0.0.1:8000"
 
+# Keep the latest prediction and XAI explanation across reruns
+if "xai_result" not in st.session_state:
+    st.session_state.xai_result = None
+
+if "prediction_result" not in st.session_state:
+    st.session_state.prediction_result = None
+
 st.set_page_config(
     page_title="Healthcare Digital Twin",
     page_icon="🩺",
@@ -422,6 +429,86 @@ try:
 
 except requests.RequestException as exc:
     st.error(f"Could not load glucose history: {exc}")
+
+
+# ---------- SMART GLUCOSE ALERTS PANEL ----------
+
+st.divider()
+st.header("🚨 Smart Glucose Alerts")
+
+st.caption(
+    "Synthetic-data demonstration. Alerts are rule-based "
+    "and are not medical advice or a diagnostic system."
+)
+
+alert_patient_id = st.text_input(
+    "Patient ID for alert analysis",
+    value="P001",
+    key="smart_alert_patient_id",
+)
+
+if st.button("Check Glucose Alerts", key="check_smart_alerts"):
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/patients/"
+            f"{alert_patient_id.strip()}/alerts",
+            timeout=10,
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        st.session_state["smart_glucose_alerts"] = result
+
+    except requests.HTTPError as error:
+        st.error(f"Alert API error: {error}")
+        if error.response is not None:
+            st.code(error.response.text)
+
+    except requests.RequestException as error:
+        st.error(f"Could not connect to FastAPI: {error}")
+
+
+# Keep the last retrieved alerts visible after Streamlit reruns.
+alert_result = st.session_state.get("smart_glucose_alerts")
+
+if alert_result is not None:
+    st.subheader(f"Patient: {alert_result.get('patient_id', 'Unknown')}")
+
+    alerts = alert_result.get("alerts", [])
+    alert_count = alert_result.get("alert_count", len(alerts))
+
+    col1, col2 = st.columns(2)
+
+    col1.metric("Alerts detected", alert_count)
+    col2.metric(
+        "Status",
+        "Review patterns" if alerts else "No rules triggered",
+    )
+    if alerts:
+        for alert in alerts:
+            with st.expander(
+                f"⚠️ {alert['type'].replace('_', ' ').title()} "
+                f"— {alert['timestamp']}",
+                expanded=True,
+            ):
+                st.write(alert["message"])
+                st.write(f"Glucose: {alert['glucose']}")
+
+                if "change" in alert:
+                    st.write(
+                        f"Change: +{alert['change']} "
+                        f"over {alert['minutes']} minutes"
+                    )
+    else:
+        st.success(
+            "No configured demo alert rules were triggered "
+            "by the available readings."
+        )
+
+    st.caption(
+        "No alert does not mean the patient is medically safe. "
+        "These rules are not clinically validated."
+    )
 
 
 # ---------------- LIVE PATIENT MONITORING ----------------
@@ -998,156 +1085,132 @@ if run_prediction:
     }
 
     try:
-        response = requests.post(
-            f"{API_BASE_URL}/predict",
-            json=payload,
-            timeout=20,
-        )
+        with st.spinner("Running AI prediction..."):
+            response = requests.post(
+                f"{API_BASE_URL}/predict",
+                json=payload,
+                timeout=20,
+            )
+            response.raise_for_status()
+            prediction = response.json()
 
-        
-        # ---------------- XAI: LOCAL SENSITIVITY ----------------
+        probability = float(prediction["probability"])
 
-        st.divider()
-        st.subheader("🧠 Explainable AI — Why did the output change?")
+        if not 0 <= probability <= 1:
+            raise ValueError("Probability must be between 0 and 1.")
 
-        st.write(
-            "This analysis changes one input at a time to a fixed "
-            "synthetic reference value and measures how the model "
-            "output changes."
-        )
+        # Save prediction so auto-refresh does not erase it
+        st.session_state.prediction_result = prediction
 
+        # Calculate XAI once per submitted prediction
         with st.spinner("Analysing model sensitivity..."):
+            st.session_state.xai_result = None
+            st.session_state.xai_error = None
+
             try:
-                original_probability, explanation_df = (
-                    explain_prediction(payload)
-                )
-
-                st.metric(
-                    "Original model output",
-                    f"{original_probability:.1%}",
-                )
-
-                if not explanation_df.empty:
-                    chart_df = explanation_df.sort_values(
-                        "Output difference (percentage points)"
-                    )
-
-                    fig = px.bar(
-                        chart_df,
-                        x="Output difference (percentage points)",
-                        y="Feature",
-                        orientation="h",
-                        title=(
-                            "Change in model output when one input "
-                            "is replaced by its reference value"
-                        ),
-                        labels={
-                            "Output difference (percentage points)": (
-                                "Output difference (percentage points)"
-                            ),
-                            "Feature": "Input feature",
-                        },
-                    )
-
-                    fig.add_vline(x=0, line_dash="dash")
-
-                    st.plotly_chart(
-                        fig,
-                        use_container_width=True,
-                    )
-
-                    st.dataframe(
-                        explanation_df,
-                        use_container_width=True,
-                    )
-
-                    st.caption(
-                        "Positive values mean the original input "
-                        "produced a higher model output than the "
-                        "reference-substituted input. Negative values "
-                        "mean it produced a lower output. These are "
-                        "local sensitivity comparisons, not causal "
-                        "effects or clinical risk factors."
-                    )
-
-                st.info(
-                    "The reference values are fixed synthetic examples. "
-                    "This is not SHAP and does not prove that a feature "
-                    "caused the prediction."
-                )
-
+                st.session_state.xai_result = explain_prediction(payload)
             except (
                 requests.RequestException,
                 KeyError,
                 TypeError,
                 ValueError,
             ) as error:
-                st.error(
-                    f"Could not calculate the explanation: {error}"
-                )
-
-
-        response.raise_for_status()
-        prediction = response.json()
-
-        st.subheader("Prediction result")
-        st.json(prediction)
-
-        probability = prediction.get("probability")
-
-        if probability is None:
-            st.info(
-                "The API responded, but no 'probability' field "
-                "was returned. Check the JSON above against your "
-                "model's response format."
-            )
-
-        else:
-            probability = float(probability)
-
-            if not 0.0 <= probability <= 1.0:
-                st.error(
-                    "The model probability must be between 0 and 1. "
-                    "Check the prediction function's output."
-                )
-
-            else:
-                st.metric(
-                    "Model output",
-                    f"{probability:.1%}",
-                )
-
-                st.progress(probability)
-
-                if probability >= threshold:
-                    st.warning(
-                        f"Demo alert: model output {probability:.1%} "
-                        f"meets the UI threshold of {threshold:.0%}."
-                    )
-                else:
-                    st.info(
-                        f"No demo alert triggered. Model output: "
-                        f"{probability:.1%}; UI threshold: {threshold:.0%}."
-                    )
-
-                st.caption(
-                    "This threshold is a UI setting, not a clinically "
-                    "validated cutoff. The synthetic demo output is not "
-                    "a real-world medical risk estimate."
-                )
+                st.session_state.xai_error = str(error)
 
     except requests.HTTPError as error:
         st.error(f"Prediction API returned an error: {error}")
-
         if error.response is not None:
             st.code(error.response.text)
 
     except requests.RequestException as error:
-        st.error(
-            f"Could not connect to the prediction API: {error}"
-        )
+        st.error(f"Could not connect to the prediction API: {error}")
 
     except (TypeError, ValueError) as error:
-        st.error(
-            f"Could not interpret the prediction response: {error}"
+        st.error(f"Could not interpret the prediction response: {error}")
+
+
+# ---------------- SAVED PREDICTION RESULT ----------------
+
+prediction = st.session_state.prediction_result
+
+if prediction is not None:
+    st.subheader("Prediction result")
+    st.json(prediction)
+
+    probability = float(prediction["probability"])
+
+    col1, col2 = st.columns(2)
+    col1.metric("Model output", f"{probability:.1%}")
+    col2.metric("Demo alert threshold", f"{threshold:.0%}")
+
+    st.progress(probability)
+
+    if probability >= threshold:
+        st.warning(
+            f"Demo alert: model output {probability:.1%} "
+            f"meets the UI threshold of {threshold:.0%}."
         )
+    else:
+        st.info(
+            f"No demo alert triggered. Model output: {probability:.1%}; "
+            f"UI threshold: {threshold:.0%}."
+        )
+
+    st.caption(
+        "Synthetic demonstration only. The threshold and prediction "
+        "are not clinically validated."
+    )
+
+
+# ---------------- SAVED EXPLAINABLE AI RESULT ----------------
+
+xai_result = st.session_state.xai_result
+
+if xai_result is not None:
+    original_probability, explanation_df = xai_result
+
+    st.divider()
+    st.subheader("🧠 Explainable AI — Why did the output change?")
+
+    st.write(
+        "Each input is replaced individually with a fixed synthetic "
+        "reference value to measure the change in model output."
+    )
+
+    st.metric("Original model output", f"{original_probability:.1%}")
+
+    if not explanation_df.empty:
+        chart_df = explanation_df.sort_values(
+            "Output difference (percentage points)"
+        )
+
+        fig = px.bar(
+            chart_df,
+            x="Output difference (percentage points)",
+            y="Feature",
+            orientation="h",
+            title="Model sensitivity to individual inputs",
+            labels={
+                "Output difference (percentage points)": (
+                    "Output difference (percentage points)"
+                ),
+                "Feature": "Input feature",
+            },
+        )
+
+        fig.add_vline(x=0, line_dash="dash")
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(explanation_df, use_container_width=True)
+
+    st.caption(
+        "Positive values mean the original input produced a higher "
+        "output than its reference-substituted version; negative values "
+        "mean a lower output. This is sensitivity analysis, not proof "
+        "of causation or a clinical explanation."
+    )
+
+elif st.session_state.get("xai_error"):
+    st.warning(
+        "Prediction succeeded, but XAI could not be calculated: "
+        + st.session_state.xai_error
+    )
